@@ -1,11 +1,16 @@
 package bayaan
 
-import "fmt"
+import (
+	"fmt"
+	"os"
+	"time"
+)
 
 type LoggerLevel int
 
 const (
-	LoggerLevelDebug LoggerLevel = iota
+	LoggerLevelTrace LoggerLevel = iota
+	LoggerLevelDebug
 	LoggerLevelInfo
 	LoggerLevelWarn
 	LoggerLevelError
@@ -16,69 +21,60 @@ const (
 )
 
 var colors = map[LoggerLevel]string{
-	LoggerLevelDebug: "\033[32m",
-	LoggerLevelInfo:  "\033[34m",
-	LoggerLevelWarn:  "\033[36m",
-	LoggerLevelError: "\033[33m",
-	LoggerLevelFatal: "\033[35m",
-	LoggerLevelPanic: "\033[31m",
+	LoggerLevelTrace: "\033[36m", // Cyan
+	LoggerLevelDebug: "\033[34m", // Blue
+	LoggerLevelInfo:  "\033[32m", // Green
+	LoggerLevelWarn:  "\033[33m", // Yellow
+	LoggerLevelError: "\033[31m", // Red
+	LoggerLevelFatal: "\033[35m", // Magenta
+	LoggerLevelPanic: "\033[95m", // Bright Magenta
 }
 
-var (
-	Reset = "\033[0m"
-	Gray  = "\033[37m"
-	White = "\033[97m"
-
-	Green   = "\033[32m"
-	Blue    = "\033[34m"
-	Cyan    = "\033[36m"
-	Yellow  = "\033[33m"
-	Magenta = "\033[35m"
-	Red     = "\033[31m"
-)
+const Reset = "\033[0m"
 
 var level LoggerLevel = LoggerLevelInfo
 
-func Debug(f string, a ...any) {
-	format := colors[LoggerLevelDebug] + "Debug: " + Reset + f
-	if level <= LoggerLevelDebug {
+// Helper function to log messages
+func logMessage(lvl LoggerLevel, levelStr, f string, a ...any) {
+	if level <= lvl {
+		format := colors[lvl] + fmt.Sprintf("[%s] %s: ", timestamp(), levelStr) + Reset + f + "\n"
 		fmt.Printf(format, a...)
 	}
+}
+
+// Get the current timestamp
+func timestamp() string {
+	return time.Now().Format("2006-01-02 15:04:05")
+}
+
+func Trace(f string, a ...any) {
+	logMessage(LoggerLevelTrace, "Trace", f, a...)
+}
+
+func Debug(f string, a ...any) {
+	logMessage(LoggerLevelDebug, "Debug", f, a...)
 }
 
 func Info(f string, a ...any) {
-	format := colors[LoggerLevelDebug] + "Info: " + Reset + f
-	if level <= LoggerLevelInfo {
-		fmt.Printf(format, a...)
-	}
+	logMessage(LoggerLevelInfo, "Info", f, a...)
 }
 
 func Warn(f string, a ...any) {
-	format := colors[LoggerLevelDebug] + "Warn: " + Reset + f
-	if level <= LoggerLevelWarn {
-		fmt.Printf(format, a...)
-	}
+	logMessage(LoggerLevelWarn, "Warn", f, a...)
 }
 
 func Error(f string, a ...any) {
-	format := colors[LoggerLevelDebug] + "Error: " + Reset + f
-	if level <= LoggerLevelError {
-		fmt.Printf(format, a...)
-	}
+	logMessage(LoggerLevelError, "Error", f, a...)
 }
 
 func Fatal(f string, a ...any) {
-	format := colors[LoggerLevelDebug] + "Fatal: " + Reset + f
-	if level <= LoggerLevelFatal {
-		fmt.Printf(format, a...)
-	}
+	logMessage(LoggerLevelFatal, "Fatal", f, a...)
+	os.Exit(1) // Exit after logging fatal error
 }
 
 func Panic(f string, a ...any) {
-	format := colors[LoggerLevelDebug] + "Panic: " + Reset + f
-	if level <= LoggerLevelPanic {
-		fmt.Printf(format, a...)
-	}
+	logMessage(LoggerLevelPanic, "Panic", f, a...)
+	panic(fmt.Sprintf(f, a...)) // Panic after logging
 }
 
 func SetLevel(newLevel LoggerLevel) {
