@@ -63,8 +63,9 @@ func Warn(f string, a ...any) {
 	logMessage(LoggerLevelWarn, "Warn", f, a...)
 }
 
-func Error(f string, a ...any) {
+func Error(f string, a ...any) (err error) {
 	logMessage(LoggerLevelError, "Error", f, a...)
+	return fmt.Errorf(f, a...)
 }
 
 func Fatal(f string, a ...any) {
