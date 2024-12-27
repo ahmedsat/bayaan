@@ -2,6 +2,7 @@ package bayaan
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -11,7 +12,6 @@ import (
 	"time"
 )
 
-// LoggerLevel represents the severity level of a log message
 type LoggerLevel int
 
 const (
@@ -24,7 +24,6 @@ const (
 	LoggerLevelPanic
 )
 
-// String returns the string representation of the log level
 func (l LoggerLevel) String() string {
 	switch l {
 	case LoggerLevelTrace:
@@ -58,136 +57,174 @@ var colors = map[LoggerLevel]string{
 
 const Reset = "\033[0m"
 
-// Logger represents a logger instance with its configuration
-type Logger struct {
-	level      LoggerLevel
-	outputs    []io.Writer
-	timeFormat string
-	useColor   bool
-	mu         sync.Mutex
-	fields     Fields
+type logEntry struct {
+	level  LoggerLevel
+	msg    string
+	fields Fields
 }
 
-// Fields represents structured logging fields
+type output struct {
+	writer   io.Writer
+	useColor bool
+}
+
+type Logger struct {
+	level      LoggerLevel
+	outputs    []output
+	timeFormat string
+	mu         sync.RWMutex
+	fields     Fields
+	logChan    chan logEntry
+	done       chan struct{}
+}
+
 type Fields map[string]interface{}
 
-// LoggerOption is a function that configures a Logger
 type LoggerOption func(*Logger)
 
-// NewLogger creates a new logger with the given options
 func NewLogger(options ...LoggerOption) *Logger {
 	l := &Logger{
 		level:      LoggerLevelInfo,
-		outputs:    []io.Writer{os.Stdout},
+		outputs:    []output{{writer: os.Stdout, useColor: true}},
 		timeFormat: "2006-01-02 15:04:05",
-		useColor:   true,
 		fields:     make(Fields),
+		logChan:    make(chan logEntry, 1000), // Buffered channel to prevent blocking
+		done:       make(chan struct{}),
 	}
 
 	for _, option := range options {
 		option(l)
 	}
 
+	go l.processLogs()
+
 	return l
 }
 
-// WithLevel sets the logger level
 func WithLevel(level LoggerLevel) LoggerOption {
 	return func(l *Logger) {
+		l.mu.Lock()
 		l.level = level
+		l.mu.Unlock()
 	}
 }
 
-// WithOutput adds an output writer
-func WithOutput(output io.Writer) LoggerOption {
+func WithOutput(writer io.Writer, additive bool, useColor bool) LoggerOption {
 	return func(l *Logger) {
-		l.outputs = append(l.outputs, output)
+		l.mu.Lock()
+		if additive {
+			l.outputs = append(l.outputs, output{writer: writer, useColor: useColor})
+		} else {
+			l.outputs = []output{{writer: writer, useColor: useColor}}
+		}
+		l.mu.Unlock()
 	}
 }
 
-// WithTimeFormat sets the time format
 func WithTimeFormat(format string) LoggerOption {
 	return func(l *Logger) {
+		l.mu.Lock()
 		l.timeFormat = format
+		l.mu.Unlock()
 	}
 }
 
-// WithColor enables or disables colored output
-func WithColor(useColor bool) LoggerOption {
-	return func(l *Logger) {
-		l.useColor = useColor
-	}
-}
-
-// WithFields adds default fields to the logger
 func WithFields(fields Fields) LoggerOption {
 	return func(l *Logger) {
+		l.mu.Lock()
 		for k, v := range fields {
 			l.fields[k] = v
+		}
+		l.mu.Unlock()
+	}
+}
+
+func (l *Logger) processLogs() {
+	for {
+		select {
+		case entry := <-l.logChan:
+			l.writeLog(entry)
+		case <-l.done:
+			return
 		}
 	}
 }
 
-// log formats and writes a log message
-func (l *Logger) log(level LoggerLevel, msg string, fields Fields) {
-	if level < l.level {
+func (l *Logger) writeLog(entry logEntry) {
+	if entry.level < l.level {
 		return
 	}
 
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	// Merge default fields with message fields
-	mergedFields := make(Fields)
+	l.mu.RLock()
+	timeFormat := l.timeFormat
+	defaultFields := make(Fields, len(l.fields))
 	for k, v := range l.fields {
+		defaultFields[k] = v
+	}
+	outputs := make([]output, len(l.outputs))
+	copy(outputs, l.outputs)
+	l.mu.RUnlock()
+
+	mergedFields := make(Fields)
+	for k, v := range defaultFields {
 		mergedFields[k] = v
 	}
-	for k, v := range fields {
+	for k, v := range entry.fields {
 		mergedFields[k] = v
 	}
 
-	// Add basic log information
-	mergedFields["timestamp"] = time.Now().Format(l.timeFormat)
-	mergedFields["level"] = level.String()
-	mergedFields["message"] = msg
+	mergedFields["timestamp"] = time.Now().Format(timeFormat)
+	mergedFields["level"] = entry.level.String()
+	mergedFields["message"] = entry.msg
 
-	// Add caller information
-	if _, file, line, ok := runtime.Caller(2); ok {
+	if _, file, line, ok := runtime.Caller(3); ok {
 		mergedFields["caller"] = fmt.Sprintf("%s:%d", filepath.Base(file), line)
 	}
 
-	var output []byte
-	var err error
-	output, err = json.Marshal(mergedFields)
+	output, err := json.Marshal(mergedFields)
 	if err != nil {
 		output = []byte(fmt.Sprintf("error marshaling log entry: %v", err))
 	}
 
-	logLine := string(output) + "\n"
-	if l.useColor {
-		logLine = colors[level] + logLine + Reset
-	}
-
-	for _, w := range l.outputs {
-		_, _ = fmt.Fprint(w, logLine)
+	for _, out := range outputs {
+		logLine := string(output) + "\n"
+		if out.useColor {
+			logLine = colors[entry.level] + logLine + Reset
+		}
+		_, _ = fmt.Fprint(out.writer, logLine)
 	}
 }
 
-// With creates a new logger with additional fields
+func (l *Logger) Close() {
+	close(l.done)
+}
+
+func (l *Logger) log(level LoggerLevel, msg string, fields Fields) {
+	select {
+	case l.logChan <- logEntry{level: level, msg: msg, fields: fields}:
+	default:
+		// Channel is full, log a warning and drop the message
+		fmt.Fprintf(os.Stderr, "Warning: Logger channel full, dropping message: %s\n", msg)
+	}
+}
+
 func (l *Logger) With(fields Fields) *Logger {
+	l.mu.RLock()
 	newLogger := &Logger{
 		level:      l.level,
-		outputs:    l.outputs,
+		outputs:    make([]output, len(l.outputs)),
 		timeFormat: l.timeFormat,
-		useColor:   l.useColor,
 		fields:     make(Fields),
+		logChan:    l.logChan,
+		done:       l.done,
 	}
+	copy(newLogger.outputs, l.outputs)
 
-	// Copy existing fields
 	for k, v := range l.fields {
 		newLogger.fields[k] = v
 	}
-	// Add new fields
+	l.mu.RUnlock()
+
 	for k, v := range fields {
 		newLogger.fields[k] = v
 	}
@@ -195,48 +232,70 @@ func (l *Logger) With(fields Fields) *Logger {
 	return newLogger
 }
 
-// Trace logs a message at trace level
 func (l *Logger) Trace(msg string, fields Fields) {
 	l.log(LoggerLevelTrace, msg, fields)
 }
 
-// Debug logs a message at debug level
 func (l *Logger) Debug(msg string, fields Fields) {
 	l.log(LoggerLevelDebug, msg, fields)
 }
 
-// Info logs a message at info level
 func (l *Logger) Info(msg string, fields Fields) {
 	l.log(LoggerLevelInfo, msg, fields)
 }
 
-// Warn logs a message at warn level
 func (l *Logger) Warn(msg string, fields Fields) {
 	l.log(LoggerLevelWarn, msg, fields)
 }
 
-// Error logs a message at error level
 func (l *Logger) Error(msg string, fields Fields) error {
 	l.log(LoggerLevelError, msg, fields)
-	return fmt.Errorf(msg)
+	return errors.New(msg)
 }
 
-// Fatal logs a message at fatal level and exits
 func (l *Logger) Fatal(msg string, fields Fields) {
 	l.log(LoggerLevelFatal, msg, fields)
 	os.Exit(1)
 }
 
-// Panic logs a message at panic level and panics
 func (l *Logger) Panic(msg string, fields Fields) {
 	l.log(LoggerLevelPanic, msg, fields)
 	panic(msg)
 }
 
-// Default logger instance
-var defaultLogger = NewLogger()
+var defaultLogger *Logger
 
-// Global functions that use the default logger
+// Setup initializes the default logger with the provided options.
+// If no options are provided, it uses sensible defaults.
+// This should be called early in your application's lifecycle.
+func Setup(options ...LoggerOption) {
+	if len(options) == 0 {
+		// Set sensible defaults
+		options = []LoggerOption{
+			WithLevel(LoggerLevelInfo),
+			WithTimeFormat("2006-01-02 15:04:05"),
+			WithOutput(os.Stdout, false, true), // Set stdout as default output with color enabled
+			WithFields(Fields{
+				"app": os.Getenv("APP_NAME"),
+				"env": os.Getenv("APP_ENV"),
+			}),
+		}
+
+		// Add file output if LOG_FILE is set
+		if logFile := os.Getenv("LOG_FILE"); logFile != "" {
+			if f, err := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644); err == nil {
+				options = append(options, WithOutput(f, true, false)) // Append file output with color disabled
+			}
+		}
+	}
+
+	// Close existing logger if it exists
+	if defaultLogger != nil {
+		defaultLogger.Close()
+	}
+
+	defaultLogger = NewLogger(options...)
+}
 
 func Trace(msg string, fields Fields) {
 	defaultLogger.Trace(msg, fields)
@@ -266,12 +325,14 @@ func Panic(msg string, fields Fields) {
 	defaultLogger.Panic(msg, fields)
 }
 
-// SetLevel sets the level of the default logger
 func SetLevel(level LoggerLevel) {
 	defaultLogger = NewLogger(WithLevel(level))
 }
 
-// GetLevel returns the level of the default logger
 func GetLevel() LoggerLevel {
-	return defaultLogger.level
+	var level LoggerLevel
+	defaultLogger.mu.RLock()
+	level = defaultLogger.level
+	defaultLogger.mu.RUnlock()
+	return level
 }
