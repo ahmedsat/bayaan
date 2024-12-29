@@ -1,13 +1,11 @@
 package bayaan
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
-	"runtime"
+	"strings"
 	"sync"
 	"time"
 )
@@ -22,27 +20,28 @@ const (
 	LoggerLevelError
 	LoggerLevelFatal
 	LoggerLevelPanic
+
+	LoggerLevelsCount
 )
 
 func (l LoggerLevel) String() string {
-	switch l {
-	case LoggerLevelTrace:
-		return "TRACE"
-	case LoggerLevelDebug:
-		return "DEBUG"
-	case LoggerLevelInfo:
-		return "INFO"
-	case LoggerLevelWarn:
-		return "WARN"
-	case LoggerLevelError:
-		return "ERROR"
-	case LoggerLevelFatal:
-		return "FATAL"
-	case LoggerLevelPanic:
-		return "PANIC"
-	default:
-		return "UNKNOWN"
+
+	levels := []string{
+		"TRACE",
+		"DEBUG",
+		"INFO",
+		"WARN",
+		"ERROR",
+		"FATAL",
+		"PANIC",
 	}
+
+	_ = map[bool]bool{
+		false:                                 false,
+		len(levels) == int(LoggerLevelsCount): true,
+	}
+
+	return levels[l]
 }
 
 var colors = map[LoggerLevel]string{
@@ -96,7 +95,12 @@ func NewLogger(options ...LoggerOption) *Logger {
 		option(l)
 	}
 
-	go l.processLogs()
+	go func() {
+		for entry := range l.logChan {
+			l.writeLog(entry)
+		}
+		close(l.done)
+	}()
 
 	return l
 }
@@ -139,24 +143,12 @@ func WithFields(fields Fields) LoggerOption {
 	}
 }
 
-func (l *Logger) processLogs() {
-	for {
-		select {
-		case entry := <-l.logChan:
-			l.writeLog(entry)
-		case <-l.done:
-			return
-		}
-	}
-}
-
 func (l *Logger) writeLog(entry logEntry) {
 	if entry.level < l.level {
 		return
 	}
 
 	l.mu.RLock()
-	timeFormat := l.timeFormat
 	defaultFields := make(Fields, len(l.fields))
 	for k, v := range l.fields {
 		defaultFields[k] = v
@@ -165,29 +157,29 @@ func (l *Logger) writeLog(entry logEntry) {
 	copy(outputs, l.outputs)
 	l.mu.RUnlock()
 
-	mergedFields := make(Fields)
+	space := make([]byte, len(entry.level.String())+2)
+	// fill space with spaces
+	for i := range space {
+		space[i] = ' '
+	}
+	space = append([]byte{'\n'}, space...)
+
+	output := &strings.Builder{}
+	output.WriteString(entry.level.String() + ": ")
+	output.WriteString(entry.msg)
+	output.Write(space)
+	output.WriteString("time: " + time.Now().Format(l.timeFormat))
 	for k, v := range defaultFields {
-		mergedFields[k] = v
+		output.Write(space)
+		output.WriteString(fmt.Sprintf("%s: %v ", k, v))
 	}
 	for k, v := range entry.fields {
-		mergedFields[k] = v
-	}
-
-	mergedFields["timestamp"] = time.Now().Format(timeFormat)
-	mergedFields["level"] = entry.level.String()
-	mergedFields["message"] = entry.msg
-
-	if _, file, line, ok := runtime.Caller(3); ok {
-		mergedFields["caller"] = fmt.Sprintf("%s:%d", filepath.Base(file), line)
-	}
-
-	output, err := json.Marshal(mergedFields)
-	if err != nil {
-		output = []byte(fmt.Sprintf("error marshaling log entry: %v", err))
+		output.Write(space)
+		output.WriteString(fmt.Sprintf("%s: %v ", k, v))
 	}
 
 	for _, out := range outputs {
-		logLine := string(output) + "\n"
+		logLine := output.String() + "\n"
 		if out.useColor {
 			logLine = colors[entry.level] + logLine + Reset
 		}
@@ -196,7 +188,9 @@ func (l *Logger) writeLog(entry logEntry) {
 }
 
 func (l *Logger) Close() {
-	close(l.done)
+
+	close(l.logChan)
+	<-l.done
 }
 
 func (l *Logger) log(level LoggerLevel, msg string, fields Fields) {
@@ -216,7 +210,6 @@ func (l *Logger) With(fields Fields) *Logger {
 		timeFormat: l.timeFormat,
 		fields:     make(Fields),
 		logChan:    l.logChan,
-		done:       l.done,
 	}
 	copy(newLogger.outputs, l.outputs)
 
@@ -323,6 +316,10 @@ func Fatal(msg string, fields Fields) {
 
 func Panic(msg string, fields Fields) {
 	defaultLogger.Panic(msg, fields)
+}
+
+func Close() {
+	defaultLogger.Close()
 }
 
 func SetLevel(level LoggerLevel) {
